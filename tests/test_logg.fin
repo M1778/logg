@@ -217,7 +217,10 @@ fun run_mode(mode: string) <noret> {
         let keys <Collection<string>> = Collection::<string>{};
         let vals <Collection<string>> = Collection::<string>{};
         logg_fields(&l, 4, "fatal-fields-marker", &keys, &vals);
-#c_ifdef FIN_TARGET_LINUX
+#c_ifdef FIN_TARGET_WINDOWS
+#c_else
+    // Selected only on Linux by run_tests.py. The fallback keeps this mode
+    // available with older Linux compilers that define no FIN_TARGET_* macros.
     } else if (equals(mode, "full")) {
         logg_set_file(&l, "/dev/full");
         assert_eq_int(logg_try_emit(&l, 1, "must-fail"), 5, "delayed write error reported");
