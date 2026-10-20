@@ -150,20 +150,37 @@ finc -I src tests/test_logg.fin -o test_logg
 ./test_logg
 ```
 
-The full POSIX regression runner uses Python 3 and a C compiler for deterministic
-Linux write/flush fault injection. It compiles tests and the example at both
-optimization levels, uses isolated temporary directories, parses JSON with
-rejection of duplicate keys, and removes generated binaries/logs afterwards:
+The full regression runner supports native Linux, macOS, and Windows Python 3.
+It compiles tests and the example at both optimization levels, uses isolated
+temporary directories (`.exe` binaries on Windows), parses JSON with rejection
+of duplicate keys, and removes generated binaries/logs afterwards:
 
 ```sh
 python3 -I tests/run_tests.py --finc /path/to/finc --fin-libs /path/to/lib/std
 ```
 
-It also tests `/dev/full` when available, captures fatal records, and benchmarks
-one million filtered calls plus 2,000 JSON records at 16 and 32 KiB. RSS growth
-above an empty-process baseline must stay below 12 MiB; wall times and scaling
-are reported rather than asserted to avoid timing-sensitive failures.
-Linux is verified; Windows/Darwin bindings are present but not exercised here.
+On Windows, use a Developer PowerShell with `clang` available and `FIN_CC=clang`,
+then run `python -I tests/run_tests.py --finc C:\path\finc.exe --fin-libs C:\path\lib\std`.
+Standalone Windows builds likewise need `-o test_logg.exe` and `.\test_logg.exe`.
+
+Golden/file-error/metadata/JSON tests and captured fatal assertions run on every
+platform. Fatal tests require both the blame diagnostic and the platform's abort
+status; the Windows test executable suppresses interactive CRT abort reporting.
+Windows console assertions allow CRT CRLF translation without weakening the
+byte-exact LF checks for binary log files. The library does not change stdout's
+CRT mode; byte-oriented text/binary stdout is supported, not wide-character modes.
+Linux additionally uses `/dev/full` and a C-compiler-built `LD_PRELOAD` shim to
+inject partial-write, EINTR, and flush failures; neither mechanism runs elsewhere.
+
+The runner benchmarks one million filtered calls plus 2,000 JSON records at 16
+and 32 KiB (`NUL` on Windows, `/dev/null` otherwise). Per-child peak memory uses
+POSIX `wait4` or Windows `GetProcessMemoryInfo`; growth over an empty-process
+baseline must stay below 12 MiB. Wall times and scaling are reported rather than
+asserted to avoid timing-sensitive failures.
+
+Linux O0/O2 execution is verified locally. Native Windows and macOS compilation
+and execution remain pending the cross-platform CI run; portability changes here
+are not a claim that those targets have passed.
 
 ## Dependencies
 

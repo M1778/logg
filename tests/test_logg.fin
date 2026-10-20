@@ -13,6 +13,13 @@ import { read_to_string, remove_file, file_exists } from fs::std;
 
 @define getenv(name: string) <string>;
 
+#c_ifdef FIN_TARGET_WINDOWS
+// Test-process policy only: avoid interactive UCRT abort reporting in native CI.
+// Production logg deliberately leaves process-wide error/signal policy alone.
+@define _set_abort_behavior(flags: uint, mask: uint) <uint>;
+@define _set_error_mode(mode: int) <int>;
+#c_endif
+
 fun read_back(path: string) <string> {
     let content? <string> = read_to_string(path);
     assert_true(content != null, "log file should exist and be readable");
@@ -210,9 +217,15 @@ fun run_mode(mode: string) <noret> {
         let keys <Collection<string>> = Collection::<string>{};
         let vals <Collection<string>> = Collection::<string>{};
         logg_fields(&l, 4, "fatal-fields-marker", &keys, &vals);
+#c_ifdef FIN_TARGET_LINUX
     } else if (equals(mode, "full")) {
         logg_set_file(&l, "/dev/full");
         assert_eq_int(logg_try_emit(&l, 1, "must-fail"), 5, "delayed write error reported");
+        logg_info(&l, "wrapper-must-report");
+#c_endif
+    } else if (equals(mode, "open-error")) {
+        logg_set_file(&l, "missing-logg-directory/out.log");
+        assert_eq_int(logg_try_emit(&l, 1, "must-fail"), 5, "open error reported");
         logg_info(&l, "wrapper-must-report");
     } else if (equals(mode, "console-success")) {
         assert_eq_int(logg_try_emit(&l, 1, "complete-console-marker"), 0, "short/interrupted writes retried");
@@ -238,7 +251,11 @@ fun run_mode(mode: string) <noret> {
         let message <string> = from_chars(bytes, 0, size);
         delete bytes;
         logg_set_json(&l, true);
+#c_ifdef FIN_TARGET_WINDOWS
+        logg_set_file(&l, "NUL");
+#c_else
         logg_set_file(&l, "/dev/null");
+#c_endif
         for (let i <int> = 0; i < 2000; i++) {
             assert_eq_int(logg_try_emit(&l, 1, message), 0, "large record written");
         }
@@ -249,6 +266,10 @@ fun run_mode(mode: string) <noret> {
 }
 
 fun main() <noret> {
+#c_ifdef FIN_TARGET_WINDOWS
+    _set_abort_behavior(cast<uint>(0), cast<uint>(3));
+    _set_error_mode(1);
+#c_endif
     let mode <string> = getenv("LOGG_TEST_MODE");
     if (mode != null) { run_mode(mode); return; }
     printf("== logg tests ==\n");
