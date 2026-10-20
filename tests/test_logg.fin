@@ -1,16 +1,17 @@
 // Tests for logg.
 //
-// Run: finc -I src tests/test_logg.fin -o test_logg && ./test_logg
-//
-// Strategy: point loggers at temp files, then read the files back and assert
-// on their contents. Console output is not asserted (it is eyeballed).
+// Run tests/run_tests.py for isolated files, strict JSON parsing, subprocess
+// failures, and memory/throughput checks; this file also runs standalone.
 import { Logger, logg_new, logg_set_level, logg_level, logg_set_json,
          logg_set_file, logg_level_name, logg_emit, logg_fields,
-         logg_debug, logg_info, logg_warn, logg_error } from logg::fin;
+         logg_debug, logg_info, logg_warn, logg_error, logg_fatal,
+         logg_try_emit, logg_try_fields, logg_status_name } from logg::fin;
 import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
 import { Collection } from collection::std;
-import { contains, free_str } from strings::std;
-import { read_to_string, remove_file } from fs::std;
+import { contains, free_str, equals, from_chars, clone, concat, to_chars } from strings::std;
+import { read_to_string, remove_file, file_exists } from fs::std;
+
+@define getenv(name: string) <string>;
 
 fun read_back(path: string) <string> {
     let content? <string> = read_to_string(path);
@@ -28,7 +29,7 @@ fun check_level_names() <noret> {
 }
 
 fun check_threshold_filtering() <noret> {
-    let path <string> = "/tmp/logg-threshold.log";
+    let path <string> = "logg-threshold.log";
     remove_file(path);
     let l <Logger> = logg_new("filter");
     logg_set_level(&l, 3); // ERROR
@@ -47,7 +48,7 @@ fun check_threshold_filtering() <noret> {
 }
 
 fun check_text_fields() <noret> {
-    let path <string> = "/tmp/logg-fields.log";
+    let path <string> = "logg-fields.log";
     remove_file(path);
     let l <Logger> = logg_new("srv");
     logg_set_file(&l, path);
@@ -65,7 +66,7 @@ fun check_text_fields() <noret> {
 }
 
 fun check_json_format() <noret> {
-    let path <string> = "/tmp/logg-json.log";
+    let path <string> = "logg-json.log";
     remove_file(path);
     let l <Logger> = logg_new("api");
     logg_set_json(&l, true);
@@ -85,7 +86,7 @@ fun check_json_format() <noret> {
 }
 
 fun check_emit_shorthands() <noret> {
-    let path <string> = "/tmp/logg-shorthand.log";
+    let path <string> = "logg-shorthand.log";
     remove_file(path);
     let l <Logger> = logg_new("sh");
     logg_set_level(&l, 0); // DEBUG: everything passes
@@ -114,7 +115,142 @@ fun check_console_path() <noret> {
     assert_true(true, "console path returns");
 }
 
+fun check_single_line(content: string) <noret> {
+    let bytes <[char]> = to_chars(content);
+    assert_true(bytes.length >= 2, "record has trailing newline");
+    assert_true(bytes[bytes.length - 2] == '\n', "record newline terminator");
+    for (let i <int> = 0; i < bytes.length - 2; i++) {
+        let c <int> = cast<int>(bytes[i]);
+        if (c < 0) { c += 256; }
+        assert_true(c >= 32 && c != 127, "no raw ASCII controls within record");
+    }
+    delete bytes;
+}
+
+fun check_controls() <noret> {
+    let bytes <[char]> = new [char, 32]{};
+    for (let i <int> = 0; i < 31; i++) { bytes[i] = cast<char>(i + 1); }
+    bytes[31] = cast<char>(127);
+    let controls <string> = from_chars(bytes, 0, 32);
+    delete bytes;
+    let unicode <[char]> = [cast<char>(194), cast<char>(133), cast<char>(226), cast<char>(128), cast<char>(168), cast<char>(226), cast<char>(128), cast<char>(169)];
+    let separators <string> = from_chars(unicode, 0, 8);
+    delete unicode;
+    let prefix <string> = concat(controls, " café \\\" = ");
+    let payload <string> = concat(prefix, separators);
+    free_str(prefix); free_str(separators);
+    free_str(controls);
+    let l <Logger> = logg_new(payload);
+    let keys <&Collection<string>> = new Collection::<string>{};
+    let vals <&Collection<string>> = new Collection::<string>{};
+    keys.push(payload); vals.push(payload);
+    remove_file("logg-controls.jsonl");
+    logg_set_file(&l, "logg-controls.jsonl");
+    logg_set_json(&l, true);
+    assert_eq_int(logg_try_fields(&l, 1, payload, keys, vals), 0, "control record written");
+    let json <string> = read_back("logg-controls.jsonl");
+    check_single_line(json);
+    free_str(json);
+    remove_file("logg-controls.txt");
+    logg_set_file(&l, "logg-controls.txt");
+    logg_set_json(&l, false);
+    assert_eq_int(logg_try_fields(&l, 1, payload, keys, vals), 0, "text controls escaped");
+    let text <string> = read_back("logg-controls.txt");
+    check_single_line(text);
+    free_str(text);
+    free_str(payload);
+    // Collection's private backing buffers have no release API in this stdlib.
+    // Caller-owned collections are intentionally never destroyed by logg.
+    delete keys; delete vals;
+}
+
+fun check_status_and_keys() <noret> {
+    let l <Logger> = logg_new("status");
+    logg_set_json(&l, true);
+    remove_file("logg-rejected.jsonl");
+    logg_set_file(&l, "logg-rejected.jsonl");
+    assert_eq_int(logg_try_emit(&l, -1, "invalid"), 2, "negative level rejected");
+    assert_eq_int(logg_try_emit(&l, 5, "invalid"), 2, "large level rejected");
+    assert_eq_int(logg_try_emit(&l, 0, "filtered"), 1, "filtered status");
+    let keys <&Collection<string>> = new Collection::<string>{};
+    let vals <&Collection<string>> = new Collection::<string>{};
+    keys.push("ts");
+    assert_eq_int(logg_try_fields(&l, 1, "mismatch", keys, vals), 3, "mismatch status");
+    assert_eq_int(logg_try_fields(&l, 0, "filtered mismatch", keys, vals), 1, "filter before field inspection");
+    vals.push("spoofed");
+    let reserved <[string]> = ["ts", "level", "logger", "msg"];
+    foreach (key <string> in reserved) {
+        keys.set(0, key);
+        assert_eq_int(logg_try_fields(&l, 3, "spoof", keys, vals), 4, "reserved key rejected");
+    }
+    delete reserved;
+    keys.set(0, "user"); keys.push("other"); vals.push("second");
+    let duplicate <string> = clone("user");
+    keys.set(1, duplicate);
+    assert_eq_int(logg_try_fields(&l, 1, "duplicate", keys, vals), 4, "duplicate compared by bytes");
+    assert_true(!file_exists("logg-rejected.jsonl"), "rejection performs no I/O");
+    keys.set(1, "other"); free_str(duplicate);
+    assert_eq_int(logg_try_fields(&l, 3, "valid", keys, vals), 0, "valid fields accepted");
+    assert_eq_int(logg_try_emit(&l, 4, "fatal-status-returns"), 0, "status API does not abort");
+    logg_set_json(&l, false);
+    keys.set(0, "msg");
+    assert_eq_int(logg_try_fields(&l, 1, "text spoof", keys, vals), 4, "text metadata also protected");
+    logg_set_file(&l, "missing-logg-directory/out.log");
+    assert_eq_int(logg_try_emit(&l, 1, "bad-path"), 5, "open failure reported");
+    assert_eq_string(logg_status_name(0), "written", "status name");
+    delete keys; delete vals;
+}
+
+fun run_mode(mode: string) <noret> {
+    let l <Logger> = logg_new("subprocess");
+    if (equals(mode, "fatal")) {
+        logg_fatal(&l, "fatal-marker");
+    } else if (equals(mode, "fatal-json")) {
+        logg_set_json(&l, true);
+        let keys <Collection<string>> = Collection::<string>{};
+        let vals <Collection<string>> = Collection::<string>{};
+        logg_fields(&l, 4, "fatal-fields-marker", &keys, &vals);
+    } else if (equals(mode, "full")) {
+        logg_set_file(&l, "/dev/full");
+        assert_eq_int(logg_try_emit(&l, 1, "must-fail"), 5, "delayed write error reported");
+        logg_info(&l, "wrapper-must-report");
+    } else if (equals(mode, "console-success")) {
+        assert_eq_int(logg_try_emit(&l, 1, "complete-console-marker"), 0, "short/interrupted writes retried");
+    } else if (equals(mode, "console-error")) {
+        assert_eq_int(logg_try_emit(&l, 1, "must-fail"), 5, "console write or flush error reported");
+    } else if (equals(mode, "reject-wrapper")) {
+        let keys <&Collection<string>> = new Collection::<string>{};
+        let vals <&Collection<string>> = new Collection::<string>{};
+        keys.push("level"); vals.push("DEBUG");
+        logg_fields(&l, 3, "must-not-appear", keys, vals);
+        delete keys; delete vals;
+    } else if (equals(mode, "filtered")) {
+        logg_set_file(&l, "filtered-must-not-exist.log");
+        for (let i <int> = 0; i < 1000000; i++) { logg_debug(&l, "discarded"); }
+        assert_true(!file_exists("filtered-must-not-exist.log"), "filtered benchmark performs no I/O");
+    } else if (equals(mode, "baseline")) {
+        assert_true(logg_level(&l) == 1, "baseline");
+    } else if (equals(mode, "long") || equals(mode, "long-double")) {
+        let size <int> = 16384;
+        if (equals(mode, "long-double")) { size *= 2; }
+        let bytes <[char]> = new [char, size]{};
+        for (let i <int> = 0; i < size; i++) { bytes[i] = 'x'; }
+        let message <string> = from_chars(bytes, 0, size);
+        delete bytes;
+        logg_set_json(&l, true);
+        logg_set_file(&l, "/dev/null");
+        for (let i <int> = 0; i < 2000; i++) {
+            assert_eq_int(logg_try_emit(&l, 1, message), 0, "large record written");
+        }
+        free_str(message);
+    } else {
+        blame false, "unknown test mode";
+    }
+}
+
 fun main() <noret> {
+    let mode <string> = getenv("LOGG_TEST_MODE");
+    if (mode != null) { run_mode(mode); return; }
     printf("== logg tests ==\n");
     check_level_names();
     printf("  - level names ok\n");
@@ -128,5 +264,9 @@ fun main() <noret> {
     printf("  - emit shorthands ok\n");
     check_console_path();
     printf("  - console path ok\n");
+    check_controls();
+    printf("  - control escaping ok\n");
+    check_status_and_keys();
+    printf("  - statuses and metadata rejection ok\n");
     printf("logg: all tests passed\n");
 }

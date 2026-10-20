@@ -5,14 +5,10 @@ Structured logging for [Fin](https://github.com/M1778/Fin). Zero dependencies.
 Levels, key=value structured fields, console + file outputs, optional
 JSON-lines format, and level filtering through a per-logger threshold.
 
-> **Verification status:** VERIFIED 2026-10-20 against finc 0.4.0 (built from
-> source 2026-10-19; `libllvm22` installed via apt.llvm.org to satisfy the
-> `libLLVM.so.22.1` link). Full test suite passes (exit 0): level names,
-> threshold filtering (file readback), text fields + auto-quoting, JSON
-> format + escaping, emit shorthands, console smoke. Example runs; log file
-> output validated. Written against the Fin v0.4.0
-> [agent guide](https://github.com/M1778/Fin/blob/master/docs/agent-guide.md)
-> and the 8 measured finc backend limits documented in the repo.
+> Tested with finc 0.4.0 (contract 3) on Linux at `-O0` and `-O2`.
+> Tests parse JSON, check single-line escaping, reject metadata collisions,
+> capture fatal output, exercise write/close/flush failures, and measure the
+> filtered hot path and large-record throughput. See **Testing** below.
 
 ## Install
 
@@ -66,24 +62,38 @@ Output (JSON lines):
 
 ## Design notes
 
-- **No globals.** Fin 0.4.0 has no mutable module-level state, so there is
-  no global default logger — configuration lives in an explicit `Logger`
-  struct you own and pass by `&`. The per-logger threshold is the filtering
-  mechanism: messages below it return before any formatting or I/O, which is
-  the same gating a global threshold would give.
-- **Levels** are plain ints (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=FATAL) —
-  finc 0.4.0 does not lower `const` declarations from imported modules.
-  `logg_level_name()` maps them to readable names.
-- **FATAL aborts.** Like `testing::std`'s `assert_*`, FATAL emits the record
-  then aborts via `blame` — it is a programmer-facing failure, not a
-  recoverable error.
-- **Ownership:** `logg_new` keeps (never frees) your `name` and `file_path`
-  pointers — string literals are the normal choice. All formatted lines and
-  escaped strings are freed internally. `logg_level_name` returns literals:
-  do not free them.
-- **File output** appends one line per record (`fs::std.append_string`:
-  open-append-close per line). Simple and correct; if you log millions of
-  lines per second, batch them yourself.
+- **Filtering:** messages below the threshold return before allocating,
+  formatting, reading the clock, or touching I/O. Plain messages use stack-local
+  empty Collections; they do not allocate field containers. Argument expressions
+  are still evaluated by the caller before the logging function runs.
+- **Levels** are plain ints: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=FATAL.
+  `logg_level_name()` returns their readable names.
+- **FATAL:** existing emit functions write and then abort via `blame`. The new
+  `logg_try_*` functions return a status even at FATAL; they never abort or print
+  their own diagnostics.
+- **Ownership:** logger names, paths, field Collections, and field strings remain
+  caller-owned. The logger frees every formatting buffer, including byte arrays.
+  Strings returned by `logg_level_name` and `logg_status_name` are literals; do not
+  free them. The current stdlib Collection has no public backing-buffer release
+  method; reuse caller-owned Collections rather than allocating them per record.
+- **Single-line output:** names, messages, keys, and values escape quotes,
+  backslashes, ASCII controls (including DEL), UTF-8 C1 controls, and Unicode
+  line/paragraph separators. Text field keys and values are quoted when needed.
+  JSON keeps ordinary fields at the top level. Input is NUL-terminated UTF-8;
+  embedded NUL terminates a string, and malformed UTF-8 is not repaired.
+- **Protected metadata:** both formats reject an entire record if a field key is
+  `ts`, `level`, `logger`, or `msg`, or if two keys have identical bytes. Null keys
+  are rejected too. Empty keys are allowed. These failures cause no output I/O.
+- **Checked output:** files use open-append-write-close with both write and close
+  results checked. Console output flushes C output streams before a checked,
+  unbuffered stdout write, retrying interrupted and partial writes. This preserves
+  buffered `printf` ordering and fatal output when stdout is redirected. A flush
+  failure still returns an error even if the record itself was written.
+  A successful status is not an `fsync` durability guarantee. A failed write may
+  leave a partial record; concurrent multi-process records are not guaranteed
+  atomic. POSIX SIGPIPE policy remains the application's responsibility: writing
+  a closed pipe can terminate the process unless the application handles/ignores
+  SIGPIPE. The library never changes signal handlers.
 
 ## API Reference
 
@@ -105,13 +115,61 @@ Output (JSON lines):
 | `logg_emit(&l, level, msg)` | Plain message at a level. |
 | `logg_debug/info/warn/error(&l, msg)` | Shorthands. |
 | `logg_fatal(&l, msg)` | Emits, then aborts via blame. |
-| `logg_fields(&l, level, msg, &keys, &vals)` | Structured `key=value` (text) / `"k":"v"` (JSON) fields; `keys[i]` belongs to `vals[i]`; mismatched lengths blame. |
+| `logg_fields(&l, level, msg, &keys, &vals)` | Structured fields; mismatched lengths blame. Rejected keys/output failures report to stderr. |
+| `logg_try_emit(&l, level, msg) <int>` | Plain message; returns status, never aborts. |
+| `logg_try_fields(&l, level, msg, &keys, &vals) <int>` | Structured message; returns status, never aborts. |
+| `logg_status_name(status: int) <string>` | Human-readable status literal. |
+
+### Status results
+
+| Code | Meaning |
+|---|---|
+| 0 | Record written. |
+| 1 | Filtered; no allocation or I/O. |
+| 2 | Invalid level (not 0–4). |
+| 3 | Keys/values length mismatch. |
+| 4 | Reserved, duplicate, or null key. |
+| 5 | Output open/write/close/flush failure, or null file path. |
+| 6 | Formatted record cannot fit a Fin int-sized buffer. |
+
+The status APIs validate the level, then filter, then validate fields. A filtered
+structured record therefore returns 1 without inspecting its keys or values.
+Legacy wrappers retain their level/count assertions even when filtered, report
+other failures as a fixed `logg: ...` line on stderr, and still abort at FATAL.
+The logger does not take ownership of inputs, including on rejection. Allocation
+failure follows the Fin/stdlib runtime policy; status 6 is a size guard, not a
+recoverable out-of-memory guarantee. Duplicate checking is quadratic in field
+count; formatting is linear in record bytes, with no per-byte allocations.
+
+## Testing
+
+The standalone Fin suite remains runnable:
+
+```sh
+finc -I src tests/test_logg.fin -o test_logg
+./test_logg
+```
+
+The full POSIX regression runner uses Python 3 and a C compiler for deterministic
+Linux write/flush fault injection. It compiles tests and the example at both
+optimization levels, uses isolated temporary directories, parses JSON with
+rejection of duplicate keys, and removes generated binaries/logs afterwards:
+
+```sh
+python3 -I tests/run_tests.py --finc /path/to/finc --fin-libs /path/to/lib/std
+```
+
+It also tests `/dev/full` when available, captures fatal records, and benchmarks
+one million filtered calls plus 2,000 JSON records at 16 and 32 KiB. RSS growth
+above an empty-process baseline must stay below 12 MiB; wall times and scaling
+are reported rather than asserted to avoid timing-sensitive failures.
+Linux is verified; Windows/Darwin bindings are present but not exercised here.
 
 ## Dependencies
 
-None beyond the Fin standard library (`collection`, `strings`, `fs`, `time`)
-and libc (`snprintf`, `calloc`, `free` — vendored `@define`s, no link flags
-needed). Zero third-party packages.
+None beyond the Fin standard library (`collection`, `strings`, `time`) and
+platform libc I/O/memory functions. No third-party runtime packages or extra
+link flags.
 
 ## License
 
