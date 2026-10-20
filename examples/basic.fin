@@ -1,0 +1,30 @@
+// Basic logg example: console + file, text + JSON.
+// Run: finc -I ../src basic.fin -o basic && ./basic
+import { Logger, logg_new, logg_set_level, logg_set_json, logg_set_file,
+         logg_info, logg_warn, logg_error, logg_fields } from logg::fin;
+import { Collection } from collection::std;
+
+fun main() <noret> {
+    // Console logger, INFO and above, human-readable text.
+    let log <Logger> = logg_new("example");
+    logg_info(&log, "server starting");
+
+    let keys <&Collection<string>> = new Collection::<string>{};
+    let vals <&Collection<string>> = new Collection::<string>{};
+    keys.push("port");
+    vals.push("8080");
+    keys.push("mode");
+    vals.push("debug build");
+    logg_fields(&log, 1, "listening", keys, vals);
+
+    // File logger, DEBUG and above, JSON lines.
+    let jl <Logger> = logg_new("example");
+    logg_set_level(&jl, 0);
+    logg_set_json(&jl, true);
+    logg_set_file(&jl, "example.log");
+    logg_info(&jl, "json line written to example.log");
+    logg_warn(&jl, "something looks off");
+
+    logg_error(&log, "shutting down");
+    printf("wrote example.log — check it for JSON lines\n");
+}

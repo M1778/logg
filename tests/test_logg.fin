@@ -1,0 +1,132 @@
+// Tests for logg.
+//
+// Run: finc -I src tests/test_logg.fin -o test_logg && ./test_logg
+//
+// Strategy: point loggers at temp files, then read the files back and assert
+// on their contents. Console output is not asserted (it is eyeballed).
+import { Logger, logg_new, logg_set_level, logg_level, logg_set_json,
+         logg_set_file, logg_level_name, logg_emit, logg_fields,
+         logg_debug, logg_info, logg_warn, logg_error } from logg::fin;
+import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
+import { Collection } from collection::std;
+import { contains, free_str } from strings::std;
+import { read_to_string, remove_file } from fs::std;
+
+fun read_back(path: string) <string> {
+    let content? <string> = read_to_string(path);
+    assert_true(content != null, "log file should exist and be readable");
+    return content?;
+}
+
+fun check_level_names() <noret> {
+    assert_eq_string(logg_level_name(0), "DEBUG", "level 0 name");
+    assert_eq_string(logg_level_name(1), "INFO", "level 1 name");
+    assert_eq_string(logg_level_name(2), "WARN", "level 2 name");
+    assert_eq_string(logg_level_name(3), "ERROR", "level 3 name");
+    assert_eq_string(logg_level_name(4), "FATAL", "level 4 name");
+    // NOTE: logg_level_name returns literals — never free them.
+}
+
+fun check_threshold_filtering() <noret> {
+    let path <string> = "/tmp/logg-threshold.log";
+    remove_file(path);
+    let l <Logger> = logg_new("filter");
+    logg_set_level(&l, 3); // ERROR
+    assert_eq_int(logg_level(&l), 3, "threshold stored");
+    logg_set_file(&l, path);
+    logg_debug(&l, "debug-should-drop");
+    logg_info(&l, "info-should-drop");
+    logg_warn(&l, "warn-should-drop");
+    logg_error(&l, "error-should-keep");
+    let content <string> = read_back(path);
+    assert_true(!contains(content, "should-drop"), "below-threshold dropped");
+    assert_true(contains(content, "error-should-keep"), "at-threshold kept");
+    assert_true(contains(content, "ERROR"), "level name in text line");
+    assert_true(contains(content, "[filter]"), "logger name in text line");
+    free_str(content);
+}
+
+fun check_text_fields() <noret> {
+    let path <string> = "/tmp/logg-fields.log";
+    remove_file(path);
+    let l <Logger> = logg_new("srv");
+    logg_set_file(&l, path);
+    let keys <&Collection<string>> = new Collection::<string>{};
+    let vals <&Collection<string>> = new Collection::<string>{};
+    keys.push("port");
+    vals.push("8080");
+    keys.push("note");
+    vals.push("hello world");
+    logg_fields(&l, 1, "listening", keys, vals);
+    let content <string> = read_back(path);
+    assert_true(contains(content, "port=8080"), "bare k=v rendered");
+    assert_true(contains(content, "note=\"hello world\""), "spaced value quoted");
+    free_str(content);
+}
+
+fun check_json_format() <noret> {
+    let path <string> = "/tmp/logg-json.log";
+    remove_file(path);
+    let l <Logger> = logg_new("api");
+    logg_set_json(&l, true);
+    logg_set_file(&l, path);
+    let keys <&Collection<string>> = new Collection::<string>{};
+    let vals <&Collection<string>> = new Collection::<string>{};
+    keys.push("user");
+    vals.push("say \"hi\"");
+    logg_fields(&l, 2, "request", keys, vals);
+    let content <string> = read_back(path);
+    assert_true(contains(content, "\"level\":\"WARN\""), "json level field");
+    assert_true(contains(content, "\"logger\":\"api\""), "json logger field");
+    assert_true(contains(content, "\"msg\":\"request\""), "json msg field");
+    assert_true(contains(content, "\"user\":\"say \\\"hi\\\"\""), "json value escaped");
+    assert_true(contains(content, "\"ts\":\""), "json timestamp field");
+    free_str(content);
+}
+
+fun check_emit_shorthands() <noret> {
+    let path <string> = "/tmp/logg-shorthand.log";
+    remove_file(path);
+    let l <Logger> = logg_new("sh");
+    logg_set_level(&l, 0); // DEBUG: everything passes
+    logg_set_file(&l, path);
+    logg_debug(&l, "d1");
+    logg_info(&l, "i1");
+    logg_warn(&l, "w1");
+    logg_error(&l, "e1");
+    logg_emit(&l, 1, "via-emit");
+    let content <string> = read_back(path);
+    assert_true(contains(content, "d1"), "debug shorthand");
+    assert_true(contains(content, "i1"), "info shorthand");
+    assert_true(contains(content, "w1"), "warn shorthand");
+    assert_true(contains(content, "e1"), "error shorthand");
+    assert_true(contains(content, "via-emit"), "raw emit");
+    free_str(content);
+}
+
+fun check_console_path() <noret> {
+    // Smoke: console output must not crash and must respect the threshold.
+    // (Output goes to stdout; the assertion is "it returns".)
+    let l <Logger> = logg_new("console");
+    logg_info(&l, "logg console smoke test — you should see this line");
+    logg_set_level(&l, 4);
+    logg_info(&l, "you should NOT see this line");
+    assert_true(true, "console path returns");
+}
+
+fun main() <noret> {
+    printf("== logg tests ==\n");
+    check_level_names();
+    printf("  - level names ok\n");
+    check_threshold_filtering();
+    printf("  - threshold filtering ok\n");
+    check_text_fields();
+    printf("  - text fields ok\n");
+    check_json_format();
+    printf("  - json format ok\n");
+    check_emit_shorthands();
+    printf("  - emit shorthands ok\n");
+    check_console_path();
+    printf("  - console path ok\n");
+    printf("logg: all tests passed\n");
+}

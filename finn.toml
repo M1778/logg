@@ -1,0 +1,10 @@
+[project]
+name = "logg"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "logg.fin"
+
+[packages]
+
+[scripts]
+test = "finc -I src tests/test_logg.fin -o test_logg && ./test_logg"

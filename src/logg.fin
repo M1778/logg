@@ -1,0 +1,300 @@
+// logg — structured logging for Fin.
+//
+// Levels, key=value structured fields, console + file outputs, optional
+// JSON-lines format, and level filtering through a per-logger threshold.
+//
+// Fin v0.4.0 backend notes (see NOTES.md; testers should file against
+// M1778/Fin):
+//   * No `const` in library modules — level codes are plain int literals,
+//     documented below.
+//   * No mutable module-level state exists in Fin 0.4.0, so there is no
+//     global default logger: configuration lives in an explicit `Logger`
+//     struct the caller owns and passes by `&`. The threshold filter gives
+//     the same "compile-time-ish" gating a global would — messages below the
+//     threshold never format and never touch I/O.
+//   * null is never passed AS a string; file_path "" means "console".
+
+import { Collection } from collection::std;
+import { len, concat, to_chars, contains } from strings::std;
+import { append_string } from fs::std;
+import { now, format_rfc3339, free_rfc3339 } from time::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Local C bindings (module-private). Vendored rather than imported: only
+// #[global] externs lower through a module import.
+// ---------------------------------------------------------------------------
+
+#[llvm_name="snprintf"]
+@define logg_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
+
+#[llvm_name="calloc"]
+@define logg_calloc(count: ulong, size: ulong) <string>;
+
+#[llvm_name="free"]
+@define logg_cfree(p: string) <noret>;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// Log levels are plain ints (finc 0.4.0 does not lower `const` declarations
+// from an imported module, not even private ones):
+//   0 = DEBUG, 1 = INFO, 2 = WARN, 3 = ERROR, 4 = FATAL.
+// Use logg_level_name() for the readable name.
+
+#[export]
+pub struct Logger {
+    pub:
+        // Threshold: messages with a lower level are dropped before any
+        // formatting or I/O happens.
+        level <int>,
+        // true -> one JSON object per line; false -> human-readable text.
+        use_json <bool>,
+        // "" = write to stdout; otherwise append each line to this file.
+        // Caller-owned.
+        file_path <string>,
+        // Logger name tag, e.g. "http" or "db". Caller-owned (usually a
+        // literal); never freed by logg.
+        name <string>,
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+// Default logger: INFO threshold, text format, stdout.
+#[export]
+pub fun logg_new(name: string) <Logger> {
+    return Logger{level: 1, use_json: false, file_path: "", name: name};
+}
+
+#[export]
+pub fun logg_set_level(l: &Logger, level: int) <noret> {
+    blame level >= 0 && level <= 4, "logg_set_level: level must be 0..4";
+    l.level = level;
+}
+
+#[export]
+pub fun logg_level(l: &Logger) <int> {
+    return l.level;
+}
+
+#[export]
+pub fun logg_set_json(l: &Logger, on: bool) <noret> {
+    l.use_json = on;
+}
+
+// Route output to a file (appended, one line per record). "" restores stdout.
+// The path pointer is kept, never freed — pass a literal or a string you own.
+#[export]
+pub fun logg_set_file(l: &Logger, path: string) <noret> {
+    l.file_path = path;
+}
+
+// Readable level name. Returns a string literal — do NOT free it.
+#[export]
+pub fun logg_level_name(level: int) <string> {
+    if (level == 0) { return "DEBUG"; }
+    if (level == 1) { return "INFO"; }
+    if (level == 2) { return "WARN"; }
+    if (level == 3) { return "ERROR"; }
+    return "FATAL";
+}
+
+// ---------------------------------------------------------------------------
+// Emitting
+// ---------------------------------------------------------------------------
+
+fun logg_json_escape(s: string) <string> {
+    let src <string> = s;
+    if (src == null) { src = ""; }
+    let out <string> = logg_calloc(cast<ulong>(1), cast<ulong>(1));
+    let bytes <[char]> = to_chars(src);
+    for (let i <int> = 0; i < len(src); i++) {
+        let piece <string> = "";
+        let dynamic <bool> = false;
+        let c <char> = bytes[i];
+        if (c == '"') {
+            piece = "\\\"";
+        } else if (c == '\\') {
+            piece = "\\\\";
+        } else if (c == '\n') {
+            piece = "\\n";
+        } else if (c == '\r') {
+            piece = "\\r";
+        } else if (c == '\t') {
+            piece = "\\t";
+        } else {
+            let buf <string> = logg_calloc(cast<ulong>(2), cast<ulong>(1));
+            logg_snprintf(buf, cast<ulong>(2), "%c", c);
+            piece = buf;
+            dynamic = true;
+        }
+        let joined <string> = concat(out, piece);
+        logg_cfree(out);
+        if (dynamic) { logg_cfree(piece); }
+        out = joined;
+    }
+    return out;
+}
+
+fun logg_needs_quote(s: string) <bool> {
+    if (len(s) == 0) { return true; }
+    return contains(s, " ") || contains(s, "\"") || contains(s, "=");
+}
+
+// Render one k=v pair for the text format, quoting the value when it
+// contains spaces, quotes, or '='.
+fun logg_text_field(key: string, val: string) <string> {
+    if (logg_needs_quote(val)) {
+        let esc <string> = logg_json_escape(val);
+        let n <ulong> = cast<ulong>(len(key) + len(esc) + 8);
+        let buf <string> = logg_calloc(n, cast<ulong>(1));
+        logg_snprintf(buf, n, "%s=\"%s\"", key, esc);
+        logg_cfree(esc);
+        return buf;
+    }
+    let n <ulong> = cast<ulong>(len(key) + len(val) + 4);
+    let buf <string> = logg_calloc(n, cast<ulong>(1));
+    logg_snprintf(buf, n, "%s=%s", key, val);
+    return buf;
+}
+
+fun logg_output(l: &Logger, line: string) <noret> {
+    if (len(l.file_path) == 0) {
+        printf("%s", line);
+        return;
+    }
+    // append_string opens "ab", writes, closes — one syscall-ish path per
+    // line, simple and correct (no shared FILE* state to manage).
+    let ok <bool> = append_string(l.file_path, line);
+    if (!ok) {
+        printf("logg: failed to append to %s\n", l.file_path);
+    }
+}
+
+// Core emit path. Builds the line, writes it, frees everything. Messages
+// below the threshold return before any formatting happens.
+fun logg_write(l: &Logger, level: int, msg: string, keys: &Collection<string>, vals: &Collection<string>) <noret> {
+    if (level < l.level) { return; }
+    let m <string> = msg;
+    if (m == null) { m = ""; }
+
+    let t <long> = now();
+    let ts <string> = format_rfc3339(t);
+    let lname <string> = logg_level_name(level);
+
+    let line <string> = logg_calloc(cast<ulong>(1), cast<ulong>(1));
+    if (l.use_json) {
+        let em <string> = logg_json_escape(m);
+        let en <string> = logg_json_escape(l.name);
+        let hn <ulong> = cast<ulong>(len(ts) + len(lname) + len(en) + len(em) + 96);
+        let head <string> = logg_calloc(hn, cast<ulong>(1));
+        logg_snprintf(head, hn,
+                      "{\"ts\":\"%s\",\"level\":\"%s\",\"logger\":\"%s\",\"msg\":\"%s\"",
+                      ts, lname, en, em);
+        logg_cfree(em);
+        logg_cfree(en);
+        let joined <string> = concat(line, head);
+        logg_cfree(line);
+        logg_cfree(head);
+        line = joined;
+        let nf <int> = keys.len();
+        for (let i <int> = 0; i < nf; i++) {
+            let k <string> = logg_json_escape(keys.get(i));
+            let v <string> = logg_json_escape(vals.get(i));
+            let fn2 <ulong> = cast<ulong>(len(k) + len(v) + 16);
+            let fbuf <string> = logg_calloc(fn2, cast<ulong>(1));
+            logg_snprintf(fbuf, fn2, ",\"%s\":\"%s\"", k, v);
+            logg_cfree(k);
+            logg_cfree(v);
+            joined = concat(line, fbuf);
+            logg_cfree(line);
+            logg_cfree(fbuf);
+            line = joined;
+        }
+        joined = concat(line, "}\n");
+        logg_cfree(line);
+        line = joined;
+    } else {
+        let hn <ulong> = cast<ulong>(len(ts) + len(lname) + len(l.name) + len(m) + 32);
+        let head <string> = logg_calloc(hn, cast<ulong>(1));
+        logg_snprintf(head, hn, "%s %s [%s] %s", ts, lname, l.name, m);
+        let joined <string> = concat(line, head);
+        logg_cfree(line);
+        logg_cfree(head);
+        line = joined;
+        let nf <int> = keys.len();
+        for (let i <int> = 0; i < nf; i++) {
+            let f <string> = logg_text_field(keys.get(i), vals.get(i));
+            let f2 <string> = concat(" ", f);
+            logg_cfree(f);
+            joined = concat(line, f2);
+            logg_cfree(line);
+            logg_cfree(f2);
+            line = joined;
+        }
+        joined = concat(line, "\n");
+        logg_cfree(line);
+        line = joined;
+    }
+
+    free_rfc3339(ts);
+    logg_output(l, line);
+    logg_cfree(line);
+}
+
+// Emit a plain message at `level`. No fields.
+#[export]
+pub fun logg_emit(l: &Logger, level: int, msg: string) <noret> {
+    blame level >= 0 && level <= 4, "logg_emit: level must be 0..4";
+    let keys <&Collection<string>> = new Collection::<string>{};
+    let vals <&Collection<string>> = new Collection::<string>{};
+    logg_write(l, level, msg, keys, vals);
+    if (level == 4) {
+        blame false, "logg: FATAL — aborting";
+    }
+}
+
+// Emit with structured key=value fields. keys[i] belongs to vals[i];
+// mismatched lengths are a programmer error (blame).
+#[export]
+pub fun logg_fields(l: &Logger, level: int, msg: string, keys: &Collection<string>, vals: &Collection<string>) <noret> {
+    blame level >= 0 && level <= 4, "logg_fields: level must be 0..4";
+    blame keys.len() == vals.len(), "logg_fields: keys/vals length mismatch";
+    logg_write(l, level, msg, keys, vals);
+    if (level == 4) {
+        blame false, "logg: FATAL — aborting";
+    }
+}
+
+#[export]
+pub fun logg_debug(l: &Logger, msg: string) <noret> {
+    logg_emit(l, 0, msg);
+}
+
+#[export]
+pub fun logg_info(l: &Logger, msg: string) <noret> {
+    logg_emit(l, 1, msg);
+}
+
+#[export]
+pub fun logg_warn(l: &Logger, msg: string) <noret> {
+    logg_emit(l, 2, msg);
+}
+
+#[export]
+pub fun logg_error(l: &Logger, msg: string) <noret> {
+    logg_emit(l, 3, msg);
+}
+
+// FATAL emits the record, then aborts via blame (mirrors testing::std's
+// assert_* semantics: programmer-facing failures abort).
+#[export]
+pub fun logg_fatal(l: &Logger, msg: string) <noret> {
+    logg_emit(l, 4, msg);
+}
+
+}
