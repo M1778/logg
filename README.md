@@ -178,12 +178,12 @@ POSIX `wait4` or Windows `GetProcessMemoryInfo`; growth over an empty-process
 baseline must stay below 12 MiB. Wall times and scaling are reported rather than
 asserted to avoid timing-sensitive failures.
 
-Native Windows x86-64/ARM64, macOS ARM64 and both Linux architectures passed
-the O0/O2 logging runner in [native run 40034272733](https://github.com/M1778/fin-sdk/actions/runs/40034272733),
+Native Linux, macOS and Windows, each on x86-64 and ARM64, passed the O0/O2
+logging runner in [native run 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084),
 at logg revision `12b5550c2173bbe948e6385a8b49c8db4129112e`. The run used
 externally verified compiler candidate `5360b051b8e82a4f10052c3dbb77bc66cc727cd7`
-from CI run `40028977601`, not a compiler release. These are per-project results;
-unrelated projects may still fail the overall run. Published Fin `1f7afd97`
+from CI run `40028977601`, not a compiler release. All thirteen ecosystem
+projects passed across all six hosts. Published Fin `1f7afd97`
 lacks target selectors and cannot select Windows/macOS bindings correctly.
 Linux-only failure injection is not claimed as Windows/macOS coverage.
 
