@@ -178,13 +178,14 @@ POSIX `wait4` or Windows `GetProcessMemoryInfo`; growth over an empty-process
 baseline must stay below 12 MiB. Wall times and scaling are reported rather than
 asserted to avoid timing-sensitive failures.
 
-Linux O0/O2 execution is verified locally. Native Windows and macOS compilation
-requires a compiler that defines `FIN_TARGET_WINDOWS` / `FIN_TARGET_DARWIN`.
-The pinned upstream Fin revision `1f7afd97` does not initialize these target
-macros, so Windows/macOS native validation is blocked upstream until that
-compiler capability lands. Linux uses the existing fallback bindings. The
-portable runner is ready for the native matrix, but these changes are not a
-claim that Windows or macOS compilation/execution has passed.
+Native Linux, macOS and Windows, each on x86-64 and ARM64, passed the O0/O2
+logging runner in [native run 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084),
+at logg revision `12b5550c2173bbe948e6385a8b49c8db4129112e`. The run used
+externally verified compiler candidate `5360b051b8e82a4f10052c3dbb77bc66cc727cd7`
+from CI run `40028977601`, not a compiler release. All thirteen ecosystem
+projects passed across all six hosts. Published Fin `1f7afd97`
+lacks target selectors and cannot select Windows/macOS bindings correctly.
+Linux-only failure injection is not claimed as Windows/macOS coverage.
 
 ## Dependencies
 
