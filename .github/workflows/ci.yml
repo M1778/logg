@@ -1,69 +1,62 @@
 name: CI
 
+# The compiler comes from a pinned published release, not from a source build.
+#
+# This used to clone M1778/Fin and run ./build.sh, which cost twenty minutes per job and
+# needed Conan, CMake, Flex, Bison and LLVM 22 on every runner. It also tested whatever the
+# compiler's master happened to be at the time, so a red run could not be attributed without
+# reading a second repository.
+#
+# FINC_VERSION pins it; .github/scripts/install_finc.py verifies the archive's sha256 against
+# the release index before unpacking. On Linux it takes the static musl build, which needs no
+# LLVM runtime on the runner.
+
 on:
   push:
     branches: [master, main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's failure must not cancel the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build bison flex python3 pipx clang gpg curl git
-          pipx install conan
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Install LLVM 22
-        run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq llvm-22-dev clang-22 libllvm22
-
-      - name: Restore finc toolchain cache
-        id: finc-restore
-        uses: actions/cache/restore@v4
+      - uses: actions/setup-python@v6
         with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
+          python-version: '3.12'
 
-      - name: Build finc (on cache miss)
-        if: steps.finc-restore.outputs.cache-hit != 'true'
+      - name: Install the pinned finc
+        shell: bash
+        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+
+      - name: Put finc on PATH
+        shell: bash
         run: |
-          export PATH="$HOME/.local/bin:/usr/lib/llvm-22/bin:$PATH"
-          git clone --depth 1 https://github.com/M1778/Fin.git /tmp/Fin
-          cd /tmp/Fin && ./build.sh --release --no-test
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/finc/bin/finc" --version
 
-      - name: Save finc toolchain cache
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
+      - name: Type-check the library
+        shell: bash
+        run: finc src/logg.fin
 
-      - name: finc version
+      # tests/run_tests.py is the real suite: O0 and O2 runs, JSON round-trip parsing of the
+      # emitted records, subprocess checks for the fatal and error paths, and the benchmarks.
+      - name: Build and run the tests
+        shell: bash
+        run: python tests/run_tests.py
+
+      - name: Build and run the example
+        shell: bash
         run: |
-          echo "/tmp/Fin/build" >> "$GITHUB_PATH"
-          /tmp/Fin/build/finc --version
-
-      - name: Frontend check
-        run: |
-          finc src/logg.fin
-
-      - name: Build and run tests
-        run: |
-          finc tests/test_logg.fin -I src -o test_logg && ./test_logg
-
-      - name: Build and run example
-        run: |
-          finc examples/basic.fin -I src -o example_basic && ./example_basic
+          finc examples/basic.fin -I src -o "$RUNNER_TEMP/example"
+          "$RUNNER_TEMP/example"
