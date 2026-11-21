@@ -1,3 +1,26 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/logg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of logg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
 // Structured logging for Fin. Logger configuration and field strings are borrowed.
 // Levels: 0 DEBUG, 1 INFO, 2 WARN, 3 ERROR, 4 FATAL.
 // Status: 0 written, 1 filtered, 2 invalid level, 3 field count mismatch,

@@ -1,0 +1,4 @@
+# The example writes a log to its working directory; run_tests.py writes into a temp dir.
+# A committed log is stale the moment anyone runs the example, and it caused a real merge
+# conflict during review: two branches each regenerated it with a different timestamp.
+example.log
