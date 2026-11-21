@@ -52,14 +52,40 @@ namespace fin {
 #[llvm_name="write"]
 @define logg_console_write(fd: int, buf: &char, size: ulong) <long>;
 #c_endif
-#[llvm_name="fopen"]
-@define logg_fopen(path: string, mode: string) <&void>;
-#[llvm_name="fwrite"]
-@define logg_fwrite(buf: string, size: ulong, count: ulong, file: &void) <ulong>;
-#[llvm_name="fclose"]
-@define logg_fclose(file: &void) <int>;
+// Still needed by the console path: C stdio output must be drained before the
+// record is written with a raw write(), or printf ordering and fatal lines break.
 #[llvm_name="fflush"]
 @define logg_fflush(file: &void) <int>;
+// Records are written to the descriptor behind a stdio stream. fopen keeps the
+// per-platform creation and mode handling, which is libc's job rather than ours,
+// and using its descriptor keeps each record a single write(); stdio's own
+// buffer is never engaged because nothing goes through fwrite. That matters
+// twice: a buffered stream splits a record larger than its buffer, which lets a
+// second writer land inside it, and the Windows CRT fails a step when a worker
+// thread reconfigures a stream with setvbuf.
+#c_ifdef FIN_TARGET_WINDOWS
+// FILE_APPEND_DATA makes every WriteFile land at the current end of the file.
+// The CRT's append mode seeks and then writes, so two threads can compute the
+// same end offset and one record overwrites the other -- that is not atomic and
+// cannot be repaired from this side.
+#[llvm_name="CreateFileA"]
+@define logg_file_open(path: string, access: uint, share: uint, security: &void,
+                       creation: uint, flags: uint, template: &void) <&void>;
+#[llvm_name="WriteFile"]
+@define logg_file_write(handle: &void, buf: &char, size: uint, written: &uint,
+                        overlapped: &void) <int>;
+#[llvm_name="CloseHandle"]
+@define logg_file_close(handle: &void) <int>;
+#c_else
+#[llvm_name="fopen"]
+@define logg_fopen(path: string, mode: string) <&void>;
+#[llvm_name="fclose"]
+@define logg_fclose(file: &void) <int>;
+#[llvm_name="fileno"]
+@define logg_fileno(file: &void) <int>;
+#[llvm_name="write"]
+@define logg_file_write(fd: int, buf: &char, size: ulong) <long>;
+#c_endif
 #c_ifdef FIN_TARGET_WINDOWS
 #[llvm_name="__acrt_iob_func"]
 @define logg_iob(index: int) <&void>;
@@ -138,21 +164,64 @@ fun logg_byte(c: char) <int> {
     return n;
 }
 
-// Also escape UTF-8 C1 controls and Unicode line/paragraph separators. Other
-// UTF-8 bytes pass through unchanged; strings are NUL-terminated, not binary.
+// Whether every continuation byte of a multi-byte sequence is present.
+fun logg_cont(bytes: [char], i: int, n: int, count: int) <bool> {
+    if (i + count >= n) { return false; }
+    for (let k <int> = 1; k <= count; k++) {
+        let c <int> = logg_byte(bytes[i + k]);
+        if (c < 128 || c > 191) { return false; }
+    }
+    return true;
+}
+
+// The width of the well-formed UTF-8 sequence at i, or 0 when the byte there
+// does not start one. Overlong forms, UTF-16 surrogates and code points past
+// U+10FFFF are rejected, so a record is always well-formed UTF-8 -- which is
+// the minimum a JSON parser accepts.
 fun logg_sequence(bytes: [char], i: int, n: int) <int> {
     let c <int> = logg_byte(bytes[i]);
-    if (c == 194 && i + 1 < n) {
-        let next <int> = logg_byte(bytes[i + 1]);
-        if (next >= 128 && next <= 159) { return 2; }
+    if (c < 128) { return 1; }
+    if (c >= 194 && c <= 223) { return logg_cont(bytes, i, n, 1) : 2 ? 0; }
+    if (c >= 224 && c <= 239) {
+        if (!logg_cont(bytes, i, n, 2)) { return 0; }
+        let first <int> = logg_byte(bytes[i + 1]);
+        if (c == 224 && first < 160) { return 0; }
+        if (c == 237 && first > 159) { return 0; }
+        return 3;
     }
-    if (c == 226 && i + 2 < n) {
-        if (logg_byte(bytes[i + 1]) == 128) {
-            let last <int> = logg_byte(bytes[i + 2]);
-            if (last == 168 || last == 169) { return 3; }
-        }
+    if (c >= 240 && c <= 244) {
+        if (!logg_cont(bytes, i, n, 3)) { return 0; }
+        let first <int> = logg_byte(bytes[i + 1]);
+        if (c == 240 && first < 144) { return 0; }
+        if (c == 244 && first > 143) { return 0; }
+        return 4;
     }
-    return 1;
+    return 0;
+}
+
+// The code point at i for a sequence of width 1..4. Multiplication and modulo
+// rather than bitwise operators: the same bytes, no reliance on `&` meaning
+// "and" when it also means "address of".
+fun logg_codepoint(bytes: [char], i: int, width: int) <int> {
+    let c <int> = logg_byte(bytes[i]);
+    if (width <= 1) { return c; }
+    if (width == 2) { return (c - 192) * 64 + logg_byte(bytes[i + 1]) - 128; }
+    if (width == 3) {
+        return (c - 224) * 4096 + (logg_byte(bytes[i + 1]) - 128) * 64
+            + logg_byte(bytes[i + 2]) - 128;
+    }
+    return (c - 240) * 262144 + (logg_byte(bytes[i + 1]) - 128) * 4096
+        + (logg_byte(bytes[i + 2]) - 128) * 64 + logg_byte(bytes[i + 3]) - 128;
+}
+
+// What a raw newline, a JSON parser, or a line-oriented reader would treat as a
+// separator: ASCII controls, DEL, C1 controls and U+2028/U+2029. A width of 0
+// means the byte starts no well-formed sequence, so it is escaped too: passing
+// it through would emit a line no JSON parser accepts.
+fun logg_escapes(width: int, point: int) <bool> {
+    return width == 0 || point < 32 || point == 127
+        || (point >= 128 && point <= 159)
+        || point == 8232 || point == 8233;
 }
 
 fun logg_hex(n: int) <char> {
@@ -170,39 +239,45 @@ fun? logg_escape(s: string) <string> {
     let size <long> = 0;
     let i <int> = 0;
     while (i < n) {
-        let c <int> = logg_byte(bytes[i]);
         let width <int> = logg_sequence(bytes, i, n);
-        if (width > 1 || c < 32 || c == 127) {
+        let c <int> = logg_byte(bytes[i]);
+        // An ill-formed byte (width 0) is escaped as its own value: dropping it
+        // or writing U+0000 would silently rewrite the caller's message.
+        let point <int> = width == 0 : c ? logg_codepoint(bytes, i, width);
+        if (logg_escapes(width, point)) {
             size += 6;
         } else if (c == 34 || c == 92) {
             size += 2;
         } else {
-            size++;
+            size += width;
         }
-        i += width;
+        if (width == 0) { i++; } else { i += width; }
     }
     if (size >= 2147483647) { delete bytes; return null; }
     let out <[char]> = new [char, cast<int>(size) + 1]{};
     let pos <int> = 0;
     i = 0;
     while (i < n) {
-        let c <int> = logg_byte(bytes[i]);
         let width <int> = logg_sequence(bytes, i, n);
-        if (width > 1 || c < 32 || c == 127) {
-            if (width == 2) { c = logg_byte(bytes[i + 1]); }
-            if (width == 3) { c = 8232 + logg_byte(bytes[i + 2]) - 168; }
+        let c <int> = logg_byte(bytes[i]);
+        let point <int> = width == 0 : c ? logg_codepoint(bytes, i, width);
+        if (logg_escapes(width, point)) {
             out[pos] = '\\'; out[pos + 1] = 'u';
-            out[pos + 2] = logg_hex(c / 4096);
-            out[pos + 3] = logg_hex((c / 256) % 16);
-            out[pos + 4] = logg_hex((c / 16) % 16);
-            out[pos + 5] = logg_hex(c % 16);
+            out[pos + 2] = logg_hex(point / 4096);
+            out[pos + 3] = logg_hex((point / 256) % 16);
+            out[pos + 4] = logg_hex((point / 16) % 16);
+            out[pos + 5] = logg_hex(point % 16);
             pos += 6;
         } else if (c == 34 || c == 92) {
             out[pos] = '\\'; out[pos + 1] = bytes[i]; pos += 2;
         } else {
-            out[pos] = bytes[i]; pos++;
+            // A well-formed sequence that needs no escape is copied whole; a
+            // byte-at-a-time copy would truncate the character it passes through.
+            for (let k <int> = 0; k < width; k++) {
+                out[pos] = bytes[i + k]; pos++;
+            }
         }
-        i += width;
+        if (width == 0) { i++; } else { i += width; }
     }
     let result <string> = from_chars(out, 0, pos);
     delete out;
@@ -277,14 +352,45 @@ fun logg_output(l: &Logger, line: string) <int> {
         delete bytes;
         return status;
     }
+    let bytes <[char]> = to_chars(line);
+    let size <int> = bytes.length - 1;
+    let pos <int> = 0;
+    let status <int> = 0;
+#c_ifdef FIN_TARGET_WINDOWS
+    // FILE_APPEND_DATA: every WriteFile lands at the current end of the file, so
+    // one record stays one append however many threads share the path.
+    let handle <&void> = logg_file_open(l.file_path, 4, 7, null, 4, 128, null);
+    if (handle == null) { delete bytes; return 5; }
+    while (pos < size) {
+        let written <uint> = cast<uint>(0);
+        if (logg_file_write(handle, &bytes[pos], cast<uint>(size - pos), &written, null) == 0) {
+            status = 5; break;
+        }
+        if (written == cast<uint>(0)) { status = 5; break; }
+        pos += cast<int>(written);
+    }
+    if (logg_file_close(handle) == 0) { status = 5; }
+#c_else
+    // "ab" is O_APPEND, so one write() is one atomic append.
     let file <&void> = logg_fopen(l.file_path, "ab");
-    if (file == null) { return 5; }
-    let size <ulong> = cast<ulong>(len(line));
-    let written <ulong> = logg_fwrite(line, cast<ulong>(1), size, file);
-    // fclose can report a delayed buffered-write error even when fwrite succeeds.
-    let closed <int> = logg_fclose(file);
-    if (written != size || closed != 0) { return 5; }
-    return 0;
+    if (file == null) { delete bytes; return 5; }
+    let fd <int> = logg_fileno(file);
+    if (fd < 0) { logg_fclose(file); delete bytes; return 5; }
+    while (pos < size) {
+        let written <long> = logg_file_write(fd, &bytes[pos], cast<ulong>(size - pos));
+        if (written < 0) {
+            // EINTR is 4 on Linux and Darwin.
+            if (*logg_errno() == 4) { continue; }
+            status = 5; break;
+        }
+        if (written == 0) { status = 5; break; }
+        pos += cast<int>(written);
+    }
+    // fclose can report a delayed write error; the stream buffered nothing.
+    if (logg_fclose(file) != 0) { status = 5; }
+#c_endif
+    delete bytes;
+    return status;
 }
 
 fun logg_copy(out: [char], pos: int, s: string) <int> {

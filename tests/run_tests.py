@@ -30,6 +30,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 
@@ -202,6 +203,8 @@ def validate(binary, work):
         print("  Linux /dev/full checks skipped on this host")
 
     if LINUX:
+        if not shutil.which("cc"):
+            raise SystemExit("Linux lanes need a C compiler for the shim: install cc")
         shim = work / "io_faults.so"
         subprocess.run(["cc", "-shared", "-fPIC", str(Path(__file__).with_name("io_faults.c")),
                         "-o", str(shim), "-ldl"], check=True)
@@ -212,6 +215,18 @@ def validate(binary, work):
             assert result.returncode == 0 and not result.stderr, (fault, result)
             if fault == "short-eintr":
                 assert result.stdout.count(b"\n") == 1 and b"complete-console-marker" in result.stdout
+        # A record larger than stdio's buffer must reach the kernel in one write.
+        # The shim refuses a buffered large write, so a split record is caught
+        # here deterministically rather than by racing two threads.
+        large = work / "large-record.jsonl"
+        if large.exists():
+            large.unlink()
+        result = run(binary, work, "large-file-record", stdout=subprocess.PIPE,
+                     extra_env={"LD_PRELOAD": str(shim),
+                                "LOGG_IO_FAULT": "buffered-large-write"})
+        assert result.returncode == 0 and not result.stderr, result
+        assert len(records(large)) == 1, large.read_bytes()[:80]
+        assert len(records(large)[0]["msg"]) == 70000
 
     _, baseline = measure(binary, work, "baseline")
     elapsed, filtered = measure(binary, work, "filtered")

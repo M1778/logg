@@ -33,6 +33,7 @@ import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
 import { Collection } from collection::std;
 import { contains, free_str, equals, from_chars, clone, concat, to_chars } from strings::std;
 import { read_to_string, remove_file, file_exists } from fs::std;
+import { Thread } from sync::std;
 
 @define getenv(name: string) <string>;
 
@@ -45,6 +46,10 @@ import { read_to_string, remove_file, file_exists } from fs::std;
 
 fun read_back(path: string) <string> {
     let content? <string> = read_to_string(path);
+    if (content == null) {
+        // Name the path: a platform-specific open failure is otherwise invisible.
+        printf("logg test: cannot read %s\n", path);
+    }
     assert_true(content != null, "log file should exist and be readable");
     return content?;
 }
@@ -194,6 +199,119 @@ fun check_controls() <noret> {
     delete keys; delete vals;
 }
 
+// Invalid UTF-8 must still produce a line a JSON parser accepts, and must not
+// silently rewrite the caller's bytes. A lone continuation byte, an overlong
+// form (C0 AF), a UTF-16 surrogate (ED A0 80) and a byte with no continuation
+// are each escaped as their own value.
+fun check_malformed_utf8() <noret> {
+    let path <string> = "logg-malformed.jsonl";
+    remove_file(path);
+    let l <Logger> = logg_new("malformed");
+    logg_set_json(&l, true);
+    logg_set_file(&l, path);
+    let cases <[int]> = [1, 3, 5, 8];
+    foreach (count <int> in cases) {
+        let bytes <[char]> = new [char, 9]{};
+        if (count == 1) {
+            bytes[0] = cast<char>(128);                      // continuation alone
+        } else if (count == 3) {
+            bytes[0] = cast<char>(192); bytes[1] = cast<char>(175);  // overlong "/"
+        } else if (count == 5) {
+            bytes[0] = cast<char>(237); bytes[1] = cast<char>(160);
+            bytes[2] = cast<char>(128);                      // surrogate D800
+        } else {
+            bytes[0] = cast<char>(240); bytes[1] = cast<char>(159);  // truncated emoji
+        }
+        let msg <string> = from_chars(bytes, 0, count);
+        delete bytes;
+        assert_eq_int(logg_try_emit(&l, 1, msg), 0, "malformed record written");
+        free_str(msg);
+    }
+    delete cases;
+    let content <string> = read_back(path);
+    let lines <[char]> = to_chars(content);
+    let newlines <int> = 0;
+    for (let i <int> = 0; i < lines.length - 1; i++) {
+        if (lines[i] == '\n') { newlines++; }
+    }
+    assert_eq_int(newlines, 4, "one line per malformed record");
+    assert_true(!contains(content, "\"\""), "no message collapsed to empty");
+    assert_true(contains(content, "\\u0080"), "lone continuation escaped as its value");
+    assert_true(contains(content, "\\u00c0\\u00af"), "overlong bytes escaped, not dropped");
+    assert_true(contains(content, "\\u00ed\\u00a0\\u0080"), "surrogate bytes escaped");
+    assert_true(contains(content, "\\u00f0\\u009f"), "truncated sequence escaped");
+    delete lines;
+    free_str(content);
+}
+
+// Concurrent appends must not interleave. A buffered stream splits a record at
+// its 64 KiB buffer; four writers start records faster than one thread can
+// finish flushing, so a split record is reliably caught. Records are sized just
+// past the buffer, which keeps the test's own I/O small.
+fun check_concurrent_file_records() <noret> {
+    let path <string> = "logg-concurrent.jsonl";
+    remove_file(path);
+    let size <int> = 16384;
+    let bytes <[char]> = new [char, size]{};
+    for (let i <int> = 0; i < size; i++) { bytes[i] = 'a'; }
+    let message <string> = from_chars(bytes, 0, size);
+    delete bytes;
+    let l <Logger> = logg_new("conc");
+    logg_set_json(&l, true);
+    logg_set_file(&l, path);
+    let first <Thread> = Thread::spawn(() <noret> => {
+        for (let i <int> = 0; i < 20; i++) {
+            assert_eq_int(logg_try_emit(&l, 1, message), 0, "first writer record");
+        }
+    });
+    let second <Thread> = Thread::spawn(() <noret> => {
+        for (let i <int> = 0; i < 20; i++) {
+            assert_eq_int(logg_try_emit(&l, 1, message), 0, "second writer record");
+        }
+    });
+    let third <Thread> = Thread::spawn(() <noret> => {
+        for (let i <int> = 0; i < 20; i++) {
+            assert_eq_int(logg_try_emit(&l, 1, message), 0, "third writer record");
+        }
+    });
+    let fourth <Thread> = Thread::spawn(() <noret> => {
+        for (let i <int> = 0; i < 20; i++) {
+            assert_eq_int(logg_try_emit(&l, 1, message), 0, "fourth writer record");
+        }
+    });
+    first.join();
+    second.join();
+    third.join();
+    fourth.join();
+    free_str(message);
+    let content <string> = read_back(path);
+    let line_bytes <[char]> = to_chars(content);
+    // Count the record-open marker on each line. Tearing preserves every byte,
+    // so totals stay right; what breaks is alignment -- a torn line carries two
+    // openings, or a body with none. Exactly one per line is the invariant.
+    let openings <int> = 0;
+    let lines <int> = 0;
+    let torn <int> = 0;
+    for (let i <int> = 0; i < line_bytes.length - 1; i++) {
+        if (i + 4 < line_bytes.length - 1) {
+            if (line_bytes[i] == '{' && line_bytes[i + 1] == '"'
+                && line_bytes[i + 2] == 't' && line_bytes[i + 3] == 's') {
+                openings++;
+            }
+        }
+        if (line_bytes[i] == '\n') {
+            if (openings != 1) { torn++; }
+            lines++;
+            openings = 0;
+        }
+    }
+    assert_eq_int(lines, 80, "one line per record (four writers, twenty each)");
+    assert_eq_int(torn, 0, "every line is exactly one intact record");
+    delete line_bytes;
+    free_str(content);
+}
+
+
 fun check_status_and_keys() <noret> {
     let l <Logger> = logg_new("status");
     logg_set_json(&l, true);
@@ -257,6 +375,18 @@ fun run_mode(mode: string) <noret> {
         assert_eq_int(logg_try_emit(&l, 1, "complete-console-marker"), 0, "short/interrupted writes retried");
     } else if (equals(mode, "console-error")) {
         assert_eq_int(logg_try_emit(&l, 1, "must-fail"), 5, "console write or flush error reported");
+    } else if (equals(mode, "large-file-record")) {
+        // One record just past stdio's 64 KiB buffer: split across writes it
+        // can be interleaved, so the whole record must reach the kernel at once.
+        let size <int> = 70000;
+        let bytes <[char]> = new [char, size]{};
+        for (let i <int> = 0; i < size; i++) { bytes[i] = 'a'; }
+        let message <string> = from_chars(bytes, 0, size);
+        delete bytes;
+        logg_set_json(&l, true);
+        logg_set_file(&l, "large-record.jsonl");
+        assert_eq_int(logg_try_emit(&l, 1, message), 0, "large record written unbuffered");
+        free_str(message);
     } else if (equals(mode, "reject-wrapper")) {
         let keys <&Collection<string>> = new Collection::<string>{};
         let vals <&Collection<string>> = new Collection::<string>{};
@@ -313,6 +443,10 @@ fun main() <noret> {
     printf("  - console path ok\n");
     check_controls();
     printf("  - control escaping ok\n");
+    check_malformed_utf8();
+    printf("  - malformed UTF-8 escaping ok\n");
+    check_concurrent_file_records();
+    printf("  - concurrent file records ok\n");
     check_status_and_keys();
     printf("  - statuses and metadata rejection ok\n");
     printf("logg: all tests passed\n");
