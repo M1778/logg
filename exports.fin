@@ -1,2 +1,32 @@
-// Export symbols from the main library file
-export * from "src/logg";
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/logg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of logg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// finn library-template placeholder.
+//
+// `finn init --template library` writes `export * from "src/logg";`, but Fin's
+// grammar has no `export` keyword (finc: "syntax error, unexpected KW_FROM").
+// The file is kept only because `finn`'s package-layout check looks for it;
+// the real public surface is `src/logg.fin`. Do not compile this file.
+//
+// Consume the library with a module import resolved through `-I src`:
+//     import { Logger, logg_new } from logg::fin;
